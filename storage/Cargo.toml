@@ -1,10 +1,42 @@
 [package]
-name = "jdb-storage"
+name = "storage"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description.workspace = true
+description = "Storage engine for JDB"
 
 [dependencies]
+# From workspace
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+crc32fast = { workspace = true }
+log = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true, optional = true }
+
+# Optional dependencies
+memmap2 = { workspace = true, optional = true }
+
+# Storage-specific (not needed elsewhere)
+parking_lot = "0.12"  # Better mutex/rwlock implementation
+
+[dev-dependencies]
+# From workspace
+tempfile = { workspace = true }
+rand = { workspace = true }
+pretty_assertions = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = []
+debug = ["serde"]
+mmap = ["dep:memmap2"]  # Or just ["memmap2"] - both work
+
+# [[bench]]
+# name = "page_operations"
+# harness = false

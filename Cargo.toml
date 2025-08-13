@@ -1,25 +1,84 @@
 [workspace]
 members = [
-    "core",
-    "storage", 
-    "sql",
-    "server",
-    "cli",
-    "bench"
+    "storage",
+    # Future crates to add:
+    # "sql-parser",
+    # "executor", 
+    # "server",
+    # "jdb",  # Main binary
 ]
+resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Jonathan Sarig"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yourusername/jdb"
 description = "A PostgreSQL-like SQL database implemented in Rust"
 
 [workspace.dependencies]
-tokio = { version = "1.0", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
+# Async runtime (for future network layer)
+tokio = { version = "1.40", features = ["full"] }
+
+# Error handling
 anyhow = "1.0"
 thiserror = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"  # Binary serialization for wire protocol
+bytes = "1.7"    # Byte buffer management
+
+# Logging and tracing
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+log = "0.4"
+
+# Storage-specific (can be used by storage crate)
+crc32fast = "1.4"     # Checksums
+bytemuck = "1.19"     # Safe transmute (if you decide to use it)
+memmap2 = "0.9"       # Memory-mapped files (future optimization)
+
+# Testing utilities (shared across workspace)
+tempfile = "3.8"
+rand = "0.8"
+pretty_assertions = "1.4"
+proptest = "1.5"
+
+# Benchmarking
+criterion = "0.5"
+
+# CLI and configuration (for future binary)
+clap = { version = "4.5", features = ["derive", "env"] }
+config = "0.14"
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Future additions for SQL parsing
+# sqlparser = "0.39"  # Or build your own
+# pest = "2.7"        # Parser generator alternative
+
+# Future additions for networking  
+# quinn = "0.11"      # QUIC protocol (modern alternative to TCP)
+# tonic = "0.12"      # gRPC support
+
+[profile.release]
+opt-level = 3
+lto = true           # Link-time optimization
+codegen-units = 1    # Better optimization, slower compile
+
+[profile.bench]
+inherits = "release"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 2        # Optimize dependencies even in dev mode
+
+# Custom profile for testing with some optimizations
+[profile.test]
+inherits = "dev"
+opt-level = 2        # Faster tests
