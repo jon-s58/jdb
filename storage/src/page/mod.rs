@@ -58,6 +58,14 @@ impl Page {
         page
     }
 
+    pub fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
+        &self.data
+    }
+
+    pub fn from_bytes(bytes: &[u8; PAGE_SIZE]) -> Self {
+        Self { data: *bytes }
+    }
+
     pub fn header(&self) -> &PageHeader {
         unsafe {
             // SAFETY:
@@ -268,6 +276,17 @@ impl Page {
 
     pub fn fill_percentage(&self) -> f32 {
         (self.used_space() as f32 / PAGE_SIZE as f32) * 100.0
+    }
+
+    pub fn update_checksum(&mut self) {
+        use crc32fast::Hasher;
+
+        self.header_mut().checksum = 0;
+
+        let mut hasher = Hasher::new();
+        hasher.update(&self.data);
+
+        self.header_mut().checksum = hasher.finalize();
     }
 
     pub fn debug_layout(&self) {
