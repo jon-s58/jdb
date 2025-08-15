@@ -278,15 +278,34 @@ impl Page {
         (self.used_space() as f32 / PAGE_SIZE as f32) * 100.0
     }
 
-    pub fn update_checksum(&mut self) {
+    fn calculate_checksum(&self) -> u32 {
         use crc32fast::Hasher;
 
-        self.header_mut().checksum = 0;
-
         let mut hasher = Hasher::new();
-        hasher.update(&self.data);
 
-        self.header_mut().checksum = hasher.finalize();
+        // Hash everything except bytes 19-23 (the checksum field)
+        hasher.update(&self.data[0..19]); // Before checksum
+        hasher.update(&self.data[23..26]); // Padding after checksum
+        hasher.update(&self.data[26..]); // Rest of page
+
+        hasher.finalize()
+    }
+
+    pub fn update_checksum(&mut self) {
+        self.header_mut().checksum = 0;
+        let checksum = self.calculate_checksum();
+        self.header_mut().checksum = checksum;
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        let stored = self.header().checksum;
+
+        // Skip verification if no checksum was set
+        if stored == 0 {
+            return true;
+        }
+
+        self.calculate_checksum() == stored
     }
 
     pub fn debug_layout(&self) {
