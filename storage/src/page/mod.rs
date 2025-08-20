@@ -1,4 +1,7 @@
-const PAGE_SIZE: usize = 8192;
+use crate::{Result, StorageError};
+use std::io::{Error, ErrorKind};
+
+pub const PAGE_SIZE: usize = 8192;
 
 #[repr(u8)] // 1 byte
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11,14 +14,16 @@ pub enum PageType {
 #[repr(C)] // Ensure consistent memory layout
 #[derive(Debug, Clone, Copy)]
 pub struct PageHeader {
-    pub page_id: u32,          // 4 bytes - page number (supports ~32TB with 8KB pages)
-    pub page_type: PageType,   // 1 byte
-    pub free_space_start: u16, // 2 bytes - offset where free space begins
-    pub free_space_end: u16,   // 2 bytes - offset where free space ends
-    pub slot_count: u16,       // 2 bytes - number of slots in directory
-    pub lsn: u64,              // 8 bytes - log sequence number for recovery
-    pub checksum: u32,         // 4 bytes - for corruption detection
-    _padding: [u8; 3],         // 3 bytes - align to 26 bytes total
+    pub page_id: u32, // 4 bytes at offset 0 - page number (supports ~32TB with 8KB pages)
+    pub page_type: PageType, // 1 byte at offset 4
+    // implicit padding: 1 byte at offset 5 (for u16 alignment)
+    pub free_space_start: u16, // 2 bytes at offset 6 - offset where free space begins
+    pub free_space_end: u16,   // 2 bytes at offset 8 - offset where free space ends
+    pub slot_count: u16,       // 2 bytes at offset 10 - number of slots in directory
+    // implicit padding: 4 bytes at offset 12-15 (for u64 alignment)
+    pub lsn: u64,      // 8 bytes at offset 16 - log sequence number for recovery
+    pub checksum: u32, // 4 bytes at offset 24 - for corruption detection
+    _padding: [u8; 4], // 4 bytes at offset 28 - explicit padding to reach 32 bytes total
 }
 
 // For slotted pages, we need slot entries
@@ -35,8 +40,8 @@ pub struct Page {
 }
 
 impl Page {
-    const HEADER_SIZE: usize = std::mem::size_of::<PageHeader>();
-    const SLOT_SIZE: usize = std::mem::size_of::<SlotEntry>();
+    pub const HEADER_SIZE: usize = std::mem::size_of::<PageHeader>();
+    pub const SLOT_SIZE: usize = std::mem::size_of::<SlotEntry>();
 
     pub fn new(page_id: u32, page_type: PageType) -> Self {
         let mut page = Self {
@@ -51,7 +56,7 @@ impl Page {
             slot_count: 0,
             lsn: 0,
             checksum: 0,
-            _padding: [0; 3],
+            _padding: [0; 4],
         };
 
         page.set_header(header);
@@ -62,8 +67,55 @@ impl Page {
         &self.data
     }
 
-    pub fn from_bytes(bytes: &[u8; PAGE_SIZE]) -> Self {
-        Self { data: *bytes }
+    pub fn as_bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        &mut self.data
+    }
+
+    pub fn from_bytes(bytes: &[u8; PAGE_SIZE]) -> Result<Self> {
+        let page = Self { data: *bytes };
+        let header = page.header();
+
+        if header.page_id == u32::MAX {
+            return Err(StorageError::Io(Error::new(
+                ErrorKind::InvalidData,
+                "Invalid page ID",
+            )));
+        }
+
+        if header.free_space_end as usize > PAGE_SIZE {
+            return Err(StorageError::Io(Error::new(
+                ErrorKind::InvalidData,
+                "free_space_end exceeds page size",
+            )));
+        }
+
+        let slot_array_end = Self::HEADER_SIZE + (header.slot_count as usize * Self::SLOT_SIZE);
+
+        if slot_array_end > PAGE_SIZE {
+            return Err(StorageError::Io(Error::new(
+                ErrorKind::InvalidData,
+                "Slot array exceeds page size",
+            )));
+        }
+
+        if slot_array_end > header.free_space_end as usize {
+            return Err(StorageError::Io(Error::new(
+                ErrorKind::InvalidData,
+                "Slot array overlaps with records",
+            )));
+        }
+
+        if !matches!(
+            header.page_type,
+            PageType::Data | PageType::Index | PageType::Overflow | PageType::Free
+        ) {
+            return Err(StorageError::Io(Error::new(
+                ErrorKind::InvalidData,
+                "Invalid page type",
+            )));
+        }
+
+        Ok(page)
     }
 
     pub fn header(&self) -> &PageHeader {
@@ -119,6 +171,9 @@ impl Page {
         }
 
         let slot_offset = Self::HEADER_SIZE + (index * Self::SLOT_SIZE);
+        if slot_offset + Self::SLOT_SIZE > PAGE_SIZE {
+            return None;
+        }
         unsafe {
             // SAFETY:
             // - Pointer arithmetic `self.data.as_ptr().add(slot_offset)` is valid because:
@@ -184,11 +239,20 @@ impl Page {
 
         let record_len = record.len();
         let slot_index = self.header().slot_count as usize;
+        let current_record_boundary = self.header().free_space_end as usize;
 
-        let new_record_end = self.header().free_space_end as usize;
-        let new_record_start = new_record_end - record_len;
+        if current_record_boundary > PAGE_SIZE || record_len > current_record_boundary {
+            return None;
+        }
 
-        self.data[new_record_start..new_record_end].copy_from_slice(record);
+        let new_record_start = current_record_boundary - record_len;
+        let slot_array_end = Self::HEADER_SIZE + ((slot_index + 1) * Self::SLOT_SIZE);
+
+        if new_record_start < slot_array_end {
+            return None;
+        }
+
+        self.data[new_record_start..current_record_boundary].copy_from_slice(record);
 
         let slot = SlotEntry {
             offset: new_record_start as u16,
@@ -242,22 +306,22 @@ impl Page {
         for i in 0..header.slot_count as usize {
             if let Some(slot) = self.get_slot(i) {
                 if slot.length > 0 {
-                    let record = self.get_record(i).unwrap();
-                    let new_start = current_end - slot.length as usize;
+                    if let Some(record) = self.get_record(i) {
+                        let new_start = current_end - slot.length as usize;
 
-                    new_data[new_start..current_end].copy_from_slice(record);
+                        new_data[new_start..current_end].copy_from_slice(record);
 
-                    let new_slot = SlotEntry {
-                        offset: new_start as u16,
-                        length: slot.length,
-                    };
+                        let new_slot = SlotEntry {
+                            offset: new_start as u16,
+                            length: slot.length,
+                        };
 
-                    unsafe {
-                        let slot_offset = Self::HEADER_SIZE + (i * Self::SLOT_SIZE);
-                        *(new_data.as_mut_ptr().add(slot_offset) as *mut SlotEntry) = new_slot;
+                        unsafe {
+                            let slot_offset = Self::HEADER_SIZE + (i * Self::SLOT_SIZE);
+                            *(new_data.as_mut_ptr().add(slot_offset) as *mut SlotEntry) = new_slot;
+                        }
+                        current_end = new_start;
                     }
-
-                    current_end = new_start;
                 }
             }
         }
@@ -269,7 +333,7 @@ impl Page {
     pub fn used_space(&self) -> usize {
         let header = self.header();
         let slots_size = header.slot_count as usize * Self::SLOT_SIZE;
-        let records_size = (PAGE_SIZE - header.free_space_end as usize);
+        let records_size = PAGE_SIZE - header.free_space_end as usize;
 
         Self::HEADER_SIZE + slots_size + records_size
     }
@@ -283,16 +347,15 @@ impl Page {
 
         let mut hasher = Hasher::new();
 
-        // Hash everything except bytes 19-23 (the checksum field)
-        hasher.update(&self.data[0..19]); // Before checksum
-        hasher.update(&self.data[23..26]); // Padding after checksum
-        hasher.update(&self.data[26..]); // Rest of page
+        // The checksum field is at bytes 24-28 (offset 24, size 4)
+        // Hash everything except the checksum field
+        hasher.update(&self.data[0..24]); // Before checksum
+        hasher.update(&self.data[28..]); // After checksum
 
         hasher.finalize()
     }
 
     pub fn update_checksum(&mut self) {
-        self.header_mut().checksum = 0;
         let checksum = self.calculate_checksum();
         self.header_mut().checksum = checksum;
     }
@@ -300,12 +363,18 @@ impl Page {
     pub fn verify_checksum(&self) -> bool {
         let stored = self.header().checksum;
 
-        // Skip verification if no checksum was set
         if stored == 0 {
             return true;
         }
 
-        self.calculate_checksum() == stored
+        use crc32fast::Hasher;
+        let mut hasher = Hasher::new();
+
+        hasher.update(&self.data[0..24]);
+        hasher.update(&[0u8; 4]);
+        hasher.update(&self.data[28..]);
+
+        hasher.finalize() == stored
     }
 
     pub fn debug_layout(&self) {
@@ -340,8 +409,9 @@ mod tests {
 
     #[test]
     fn test_header_size() {
-        assert_eq!(Page::HEADER_SIZE, 26);
-        assert_eq!(std::mem::size_of::<PageHeader>(), 26);
+        // The actual size is 32 due to alignment padding
+        assert_eq!(Page::HEADER_SIZE, 32);
+        assert_eq!(std::mem::size_of::<PageHeader>(), 32);
     }
 
     #[test]
@@ -474,5 +544,53 @@ mod tests {
 
         // Page should be nearly full
         assert!(page.fill_percentage() > 95.0);
+    }
+
+    #[test]
+    fn test_checksum() {
+        let mut page = Page::new(1, PageType::Data);
+
+        // Add some data
+        page.add_record(b"test data").unwrap();
+
+        // Calculate checksum
+        page.update_checksum();
+        let checksum = page.header().checksum;
+        assert_ne!(checksum, 0);
+
+        // Should verify successfully
+        assert!(page.verify_checksum());
+
+        // Corrupt the page
+        page.data[100] ^= 0xFF; // Flip some bits
+
+        // Should fail verification
+        assert!(!page.verify_checksum());
+
+        // Fix it and update checksum
+        page.data[100] ^= 0xFF; // Flip back
+        page.update_checksum();
+
+        // Should verify again
+        assert!(page.verify_checksum());
+    }
+
+    #[test]
+    fn test_checksum_with_modifications() {
+        let mut page = Page::new(1, PageType::Data);
+
+        page.add_record(b"first").unwrap();
+        page.update_checksum();
+        let checksum1 = page.header().checksum;
+
+        page.add_record(b"second").unwrap();
+        page.update_checksum();
+        let checksum2 = page.header().checksum;
+
+        // Checksum should change when content changes
+        assert_ne!(checksum1, checksum2);
+
+        // Both should verify at their respective points
+        assert!(page.verify_checksum());
     }
 }

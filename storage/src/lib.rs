@@ -3,6 +3,7 @@
 //! This crate provides the low-level storage primitives including
 //! pages, B-trees, and buffer management.
 
+pub mod file;
 pub mod page;
 
 pub use page::{Page, PageHeader, PageType, SlotEntry};
