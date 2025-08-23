@@ -14,16 +14,19 @@ pub enum PageType {
 #[repr(C)] // Ensure consistent memory layout
 #[derive(Debug, Clone, Copy)]
 pub struct PageHeader {
-    pub page_id: u32, // 4 bytes at offset 0 - page number (supports ~32TB with 8KB pages)
-    pub page_type: PageType, // 1 byte at offset 4
-    // implicit padding: 1 byte at offset 5 (for u16 alignment)
-    pub free_space_start: u16, // 2 bytes at offset 6 - offset where free space begins
-    pub free_space_end: u16,   // 2 bytes at offset 8 - offset where free space ends
-    pub slot_count: u16,       // 2 bytes at offset 10 - number of slots in directory
-    // implicit padding: 4 bytes at offset 12-15 (for u64 alignment)
-    pub lsn: u64,      // 8 bytes at offset 16 - log sequence number for recovery
-    pub checksum: u32, // 4 bytes at offset 24 - for corruption detection
-    _padding: [u8; 4], // 4 bytes at offset 28 - explicit padding to reach 32 bytes total
+    pub page_id: u32,          // 4 bytes at offset 0
+    pub page_type: PageType,   // 1 byte at offset 4
+    _padding1: [u8; 1],        // 1 byte at offset 5
+    pub free_space_start: u16, // 2 bytes at offset 6
+    pub free_space_end: u16,   // 2 bytes at offset 8
+    pub slot_count: u16,       // 2 bytes at offset 10
+    _padding2: [u8; 4],        // 4 bytes at offset 12-15
+    pub lsn: u64,              // 8 bytes at offset 16
+    pub checksum: u32,         // 4 bytes at offset 24
+    _padding3: [u8; 4],        // 4 bytes at offset 28
+
+    // Reserve space for future use (32 more bytes to reach 64)
+    _reserved: [u8; 32], // 32 bytes at offset 32-63
 }
 
 // For slotted pages, we need slot entries
@@ -51,12 +54,15 @@ impl Page {
         let header = PageHeader {
             page_id,
             page_type,
-            free_space_start: Self::HEADER_SIZE as u16, // Right after header
-            free_space_end: PAGE_SIZE as u16,           // At end of page
+            _padding1: [0; 1],
+            free_space_start: Self::HEADER_SIZE as u16,
+            free_space_end: PAGE_SIZE as u16,
             slot_count: 0,
+            _padding2: [0; 4],
             lsn: 0,
             checksum: 0,
-            _padding: [0; 4],
+            _padding3: [0; 4],
+            _reserved: [0; 32], // Could use for: version, flags, timestamp, etc.
         };
 
         page.set_header(header);
@@ -473,14 +479,7 @@ impl Page {
             return true;
         }
 
-        use crc32fast::Hasher;
-        let mut hasher = Hasher::new();
-
-        hasher.update(&self.data[0..24]);
-        hasher.update(&[0u8; 4]);
-        hasher.update(&self.data[28..]);
-
-        hasher.finalize() == stored
+        self.calculate_checksum() == stored
     }
 
     pub fn debug_layout(&self) {
@@ -516,8 +515,8 @@ mod tests {
     #[test]
     fn test_header_size() {
         // The actual size is 32 due to alignment padding
-        assert_eq!(Page::HEADER_SIZE, 32);
-        assert_eq!(std::mem::size_of::<PageHeader>(), 32);
+        assert_eq!(Page::HEADER_SIZE, 64);
+        assert_eq!(std::mem::size_of::<PageHeader>(), 64);
     }
 
     #[test]
@@ -825,22 +824,22 @@ mod tests {
 
         // Set slot_count to a value where slots would exceed page
         // Need: HEADER_SIZE + (count * SLOT_SIZE) > PAGE_SIZE
-        // 32 + (count * 4) > 8192
-        // count > (8192 - 32) / 4 = 2040
+        // 64 + (count * 4) > 8192
+        // count > (8192 - 64) / 4 = 2032
         page.header_mut().slot_count = 2050;
 
-        // Slot 2049 would be at offset: 32 + (2049 * 4) = 8228
-        // 8228 + 4 = 8232, which exceeds PAGE_SIZE (8192)
+        // Slot 2049 would be at offset: 64 + (2049 * 4) = 8260
+        // 8260 + 4 = 8264, which exceeds PAGE_SIZE (8192)
         assert!(page.get_slot(2049).is_none());
 
         // Also test edge case: last slot that WOULD fit
-        // Slot 2039 at offset: 32 + (2039 * 4) = 8188
+        // Slot 2039 at offset: 64 + (2031 * 4) = 8188
         // 8188 + 4 = 8192, exactly PAGE_SIZE, should work
-        assert!(page.get_slot(2039).is_some());
+        assert!(page.get_slot(2031).is_some());
 
-        // Slot 2040 at offset: 32 + (2040 * 4) = 8192
+        // Slot 2032 at offset: 64 + (2040 * 4) = 8192
         // 8192 + 4 = 8196, exceeds PAGE_SIZE, should fail
-        assert!(page.get_slot(2040).is_none());
+        assert!(page.get_slot(2032).is_none());
     }
 
     // Tests for fragmentation metrics
@@ -897,48 +896,47 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod batch_tests {
     use super::*;
-    
+
     #[test]
     fn test_batch_add_records() {
         let mut page = Page::new(1, PageType::Data);
-        
+
         let records = vec![
             b"First".as_slice(),
             b"Second".as_slice(),
             b"Third".as_slice(),
             b"Fourth".as_slice(),
         ];
-        
+
         let results = page.add_records(&records);
-        
+
         // All should succeed
         assert_eq!(results.len(), 4);
         assert!(results.iter().all(|r| r.is_some()));
-        
+
         // Verify all records are readable
         assert_eq!(page.get_record(0).unwrap(), b"First");
         assert_eq!(page.get_record(1).unwrap(), b"Second");
         assert_eq!(page.get_record(2).unwrap(), b"Third");
         assert_eq!(page.get_record(3).unwrap(), b"Fourth");
-        
+
         // Should have updated header once
         assert_eq!(page.header().slot_count, 4);
     }
-    
+
     #[test]
     fn test_batch_add_with_limited_space() {
         let mut page = Page::new(1, PageType::Data);
-        
+
         // Fill page almost completely
         let big_record = vec![b'X'; 4000];
         page.add_record(&big_record).unwrap();
 
         let vec_too_big = vec![b'Y'; 5000];
-        
+
         // Try to add multiple records with limited space
         let records = vec![
             b"Small1".as_slice(),
@@ -946,9 +944,9 @@ mod batch_tests {
             vec_too_big.as_slice(), // Too big
             b"Small3".as_slice(),
         ];
-        
+
         let results = page.add_records(&records);
-        
+
         // Some should succeed, some should fail
         assert_eq!(results.len(), 4);
         assert!(results[0].is_some()); // Small1 fits
@@ -956,11 +954,11 @@ mod batch_tests {
         assert!(results[2].is_none()); // Too big
         assert!(results[3].is_some()); // Small3 fits
     }
-    
+
     #[test]
     fn test_batch_delete_records() {
         let mut page = Page::new(1, PageType::Data);
-        
+
         // Add some records
         let records = vec![
             b"A".as_slice(),
@@ -970,11 +968,11 @@ mod batch_tests {
             b"E".as_slice(),
         ];
         page.add_records(&records);
-        
+
         // Delete multiple at once
         let to_delete = vec![1, 3]; // Delete B and D
         let deleted = page.delete_records(&to_delete);
-        
+
         assert_eq!(deleted, 2);
         assert!(page.get_record(1).is_none());
         assert!(page.get_record(3).is_none());
@@ -982,20 +980,17 @@ mod batch_tests {
         assert_eq!(page.get_record(2).unwrap(), b"C");
         assert_eq!(page.get_record(4).unwrap(), b"E");
     }
-    
+
     #[test]
     fn test_batch_performance() {
         use std::time::Instant;
 
         let owned_records: Vec<Vec<u8>> = (0..100)
-        .map(|i| format!("Record{}", i).into_bytes())
-        .collect();
-
-        let records: Vec<&[u8]> = owned_records
-            .iter()
-            .map(|v| v.as_slice())
+            .map(|i| format!("Record{}", i).into_bytes())
             .collect();
-        
+
+        let records: Vec<&[u8]> = owned_records.iter().map(|v| v.as_slice()).collect();
+
         // Individual inserts
         let mut page1 = Page::new(1, PageType::Data);
         let start = Instant::now();
@@ -1003,16 +998,16 @@ mod batch_tests {
             page1.add_record(record);
         }
         let individual_time = start.elapsed();
-        
+
         // Batch insert
         let mut page2 = Page::new(2, PageType::Data);
         let start = Instant::now();
         page2.add_records(&records);
         let batch_time = start.elapsed();
-        
+
         // Batch should be faster (less overhead)
         println!("Individual: {:?}, Batch: {:?}", individual_time, batch_time);
-        
+
         // Verify same results
         for i in 0..100 {
             assert_eq!(page1.get_record(i), page2.get_record(i));
