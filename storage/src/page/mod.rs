@@ -850,7 +850,7 @@ mod tests {
     #[test]
     fn test_from_bytes_validates_free_space_end() {
         let mut bytes = [0u8; PAGE_SIZE];
-        let mut page = Page::new(1, PageType::Data);
+        let page = Page::new(1, PageType::Data);
         bytes.copy_from_slice(page.as_bytes());
 
         // Corrupt free_space_end
@@ -863,7 +863,7 @@ mod tests {
     #[test]
     fn test_from_bytes_validates_slot_array_bounds() {
         let mut bytes = [0u8; PAGE_SIZE];
-        let mut page = Page::new(1, PageType::Data);
+        let page = Page::new(1, PageType::Data);
         bytes.copy_from_slice(page.as_bytes());
 
         // Set slot_count to huge value
@@ -929,7 +929,7 @@ mod tests {
         let mut page = Page::new(1, PageType::Data);
 
         let slot1 = page.add_record(b"first").unwrap();
-        let slot2 = page.add_record(b"second").unwrap();
+        let _slot2 = page.add_record(b"second").unwrap();
         let slot3 = page.add_record(b"third").unwrap();
 
         assert_eq!(page.deleted_count(), 0);
