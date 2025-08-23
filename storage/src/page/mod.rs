@@ -42,6 +42,32 @@ pub struct Page {
     data: [u8; PAGE_SIZE], // The actual 8KB block
 }
 
+pub struct PageIterator<'a> {
+    page: &'a Page,
+    current_slot: usize,
+}
+
+impl<'a> Iterator for PageIterator<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current_slot < self.page.header().slot_count as usize {
+            let slot_index = self.current_slot;
+            self.current_slot += 1;
+
+            if let Some(record) = self.page.get_record(slot_index) {
+                return Some(record);
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.page.header().slot_count as usize - self.current_slot;
+        (0, Some(remaining))
+    }
+}
+
 impl Page {
     pub const HEADER_SIZE: usize = std::mem::size_of::<PageHeader>();
     pub const SLOT_SIZE: usize = std::mem::size_of::<SlotEntry>();
@@ -519,6 +545,22 @@ impl Page {
         }
 
         self.calculate_checksum() == stored
+    }
+
+    pub fn iter(&self) -> PageIterator {
+        PageIterator {
+            page: self,
+            current_slot: 0,
+        }
+    }
+
+    pub fn iter_with_slots(&self) -> impl Iterator<Item = (usize, &[u8])> + '_ {
+        (0..self.header().slot_count as usize)
+            .filter_map(move |i| self.get_record(i).map(|r| (i, r)))
+    }
+
+    pub fn active_records(&self) -> usize {
+        self.iter().count()
     }
 
     pub fn debug_layout(&self) {
@@ -1051,5 +1093,48 @@ mod batch_tests {
         for i in 0..100 {
             assert_eq!(page1.get_record(i), page2.get_record(i));
         }
+    }
+}
+
+#[cfg(test)]
+mod iterator_tests {
+    use super::*;
+    
+    #[test]
+    fn test_page_iterator() {
+        let mut page = Page::new(1, PageType::Data);
+        
+        page.add_record(b"first").unwrap();
+        page.add_record(b"secon").unwrap();
+        page.add_record(b"third").unwrap();
+        
+        let records: Vec<&[u8]> = page.iter().collect();
+        assert_eq!(records, vec![b"first", b"secon", b"third"]);
+    }
+    
+    #[test]
+    fn test_iterator_skips_deleted() {
+        let mut page = Page::new(1, PageType::Data);
+        
+        let slot1 = page.add_record(b"a").unwrap();
+        let slot2 = page.add_record(b"b").unwrap();
+        let slot3 = page.add_record(b"c").unwrap();
+        
+        page.delete_record(slot2);
+        
+        let records: Vec<&[u8]> = page.iter().collect();
+        assert_eq!(records, vec![b"a", b"c"]);
+    }
+    
+    #[test]
+    fn test_iter_with_slots() {
+        let mut page = Page::new(1, PageType::Data);
+        
+        page.add_record(b"x").unwrap();
+        page.add_record(b"y").unwrap();
+        page.delete_record(0);
+        
+        let items: Vec<(usize, &[u8])> = page.iter_with_slots().collect();
+        assert_eq!(items, vec![(1, b"y".as_slice())]);
     }
 }
