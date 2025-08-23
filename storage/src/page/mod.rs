@@ -46,6 +46,45 @@ impl Page {
     pub const HEADER_SIZE: usize = std::mem::size_of::<PageHeader>();
     pub const SLOT_SIZE: usize = std::mem::size_of::<SlotEntry>();
 
+    pub fn new_uninit(page_id: u32, page_type: PageType) -> Self {
+        use std::mem::MaybeUninit;
+
+        let mut uninit: MaybeUninit<[u8; PAGE_SIZE]> = MaybeUninit::uninit();
+
+        // SAFETY: We're about to initialize the header portion,
+        // and the rest will be written before being read
+        let data = unsafe {
+            let ptr = uninit.as_mut_ptr() as *mut u8;
+
+            // Zero just the header portion
+            std::ptr::write_bytes(ptr, 0, Self::HEADER_SIZE);
+
+            // Now we can safely assume it's initialized because:
+            // 1. Header is zeroed and will be immediately overwritten
+            // 2. Rest is uninitialized but will be written before read
+            uninit.assume_init()
+        };
+
+        let mut page = Self { data };
+
+        let header = PageHeader {
+            page_id,
+            page_type,
+            _padding1: [0; 1],
+            free_space_start: Self::HEADER_SIZE as u16,
+            free_space_end: PAGE_SIZE as u16,
+            slot_count: 0,
+            _padding2: [0; 4],
+            lsn: 0,
+            checksum: 0,
+            _padding3: [0; 4],
+            _reserved: [0; 32],
+        };
+
+        page.set_header(header);
+        page
+    }
+
     pub fn new(page_id: u32, page_type: PageType) -> Self {
         let mut page = Self {
             data: [0; PAGE_SIZE],
