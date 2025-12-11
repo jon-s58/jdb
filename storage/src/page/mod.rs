@@ -471,40 +471,61 @@ impl Page {
             return;
         }
 
-        let slot_count = self.header().slot_count as usize;
+        let old_slot_count = self.header().slot_count as usize;
         let mut write_position = PAGE_SIZE;
+        let mut write_slot_index = 0;
 
-        // Process slots from first to last, moving records to end of page
-        for i in 0..slot_count {
-            if let Some(slot) = self.get_slot(i) {
-                if slot.length > 0 {
+        // Two-pass in-place compaction
+        for read_slot_index in 0..old_slot_count {
+            if let Some(slot) = self.get_slot(read_slot_index) {
+                if slot.length > 0 {  // Active slot
                     let record_len = slot.length as usize;
                     let old_start = slot.offset as usize;
                     let old_end = old_start + record_len;
 
-                    // Calculate new position (growing backwards from end)
+                    // Calculate new position for record (growing backwards from end)
                     let new_start = write_position - record_len;
 
-                    // Only move if the record isn't already in the right place
+                    // Debug assertion: verify no overlap with unprocessed records
+                    #[cfg(debug_assertions)]
+                    {
+                        // Any unprocessed slot at index > read_slot_index should not overlap
+                        for j in (read_slot_index + 1)..old_slot_count {
+                            if let Some(future_slot) = self.get_slot(j) {
+                                if future_slot.length > 0 {
+                                    let future_start = future_slot.offset as usize;
+                                    let future_end = future_start + future_slot.length as usize;
+                                    debug_assert!(
+                                        new_start >= future_end || new_start + record_len <= future_start,
+                                        "Compaction would overwrite unprocessed record at slot {}", j
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Move record data if needed
                     if new_start != old_start {
                         // Use memmove-style copy that handles overlapping regions
                         self.data.copy_within(old_start..old_end, new_start);
-
-                        // Update the slot with new offset
-                        let updated_slot = SlotEntry {
-                            offset: new_start as u16,
-                            length: slot.length,
-                        };
-                        self.set_slot(i, updated_slot);
                     }
 
+                    // Always write the compacted slot (simpler, clearer)
+                    self.set_slot(write_slot_index, SlotEntry {
+                        offset: new_start as u16,
+                        length: slot.length,
+                    });
+
                     write_position = new_start;
+                    write_slot_index += 1;
                 }
             }
         }
 
-        // Update header with new free space boundary
-        self.header_mut().free_space_end = write_position as u16;
+        // Update header with new counts and free space boundary
+        let header = self.header_mut();
+        header.free_space_end = write_position as u16;
+        header.slot_count = write_slot_index as u16;  // Update to reflect only active slots
     }
 
     pub fn used_space(&self) -> usize {
@@ -695,30 +716,41 @@ mod tests {
         let record4 = b"Fourth";
         let record5 = b"Fifth";
 
-        let slot1 = page.add_record(record1).unwrap();
-        let slot2 = page.add_record(record2).unwrap();
-        let slot3 = page.add_record(record3).unwrap();
-        let slot4 = page.add_record(record4).unwrap();
-        let slot5 = page.add_record(record5).unwrap();
+        let _slot1 = page.add_record(record1).unwrap();
+        let _slot2 = page.add_record(record2).unwrap();
+        let _slot3 = page.add_record(record3).unwrap();
+        let _slot4 = page.add_record(record4).unwrap();
+        let _slot5 = page.add_record(record5).unwrap();
 
+        assert_eq!(page.header().slot_count, 5);
         let space_before = page.free_space();
 
         // Delete 2 records (40% - exceeds threshold and >= 2 deleted)
-        page.delete_record(slot2);
-        page.delete_record(slot4);
+        page.delete_record(1);  // Delete "Second"
+        page.delete_record(3);  // Delete "Fourth"
+
+        // Before compaction: 5 slots (3 active, 2 deleted)
+        assert_eq!(page.header().slot_count, 5);
+        assert_eq!(page.deleted_count(), 2);
 
         // Compact the page
         page.compact();
 
+        // After compaction: only 3 slots (all active)
+        assert_eq!(page.header().slot_count, 3);
+        assert_eq!(page.deleted_count(), 0);
+
         // Check that we reclaimed space
         assert!(page.free_space() > space_before);
 
-        // Verify remaining records are intact
-        assert_eq!(page.get_record(slot1).unwrap(), record1);
-        assert!(page.get_record(slot2).is_none()); // Still deleted
-        assert_eq!(page.get_record(slot3).unwrap(), record3);
-        assert!(page.get_record(slot4).is_none()); // Still deleted
-        assert_eq!(page.get_record(slot5).unwrap(), record5);
+        // Verify remaining records are intact (with new slot indices)
+        assert_eq!(page.get_record(0).unwrap(), record1);
+        assert_eq!(page.get_record(1).unwrap(), record3);
+        assert_eq!(page.get_record(2).unwrap(), record5);
+
+        // Old slot indices should be invalid
+        assert!(page.get_record(3).is_none());
+        assert!(page.get_record(4).is_none());
     }
 
     #[test]
@@ -974,6 +1006,42 @@ mod tests {
 
         // Should not compact (below threshold)
         assert_eq!(page.data, data_before);
+    }
+
+    #[test]
+    fn test_compaction_updates_slot_count() {
+        let mut page = Page::new(1, PageType::Data);
+
+        // Add 10 records
+        for i in 0..10 {
+            page.add_record(format!("record{}", i).as_bytes()).unwrap();
+        }
+
+        assert_eq!(page.header().slot_count, 10);
+        assert_eq!(page.active_records(), 10);
+
+        // Delete every other record (50%)
+        for i in (0..10).step_by(2) {
+            page.delete_record(i);
+        }
+
+        assert_eq!(page.header().slot_count, 10);  // Still 10 slots
+        assert_eq!(page.deleted_count(), 5);
+        assert_eq!(page.active_records(), 5);
+
+        // After compaction
+        page.compact();
+
+        assert_eq!(page.header().slot_count, 5);   // Now only 5 slots
+        assert_eq!(page.deleted_count(), 0);       // No deleted slots
+        assert_eq!(page.active_records(), 5);      // Still 5 active records
+
+        // Verify the 5 remaining records are the odd-numbered ones
+        assert_eq!(page.get_record(0).unwrap(), b"record1");
+        assert_eq!(page.get_record(1).unwrap(), b"record3");
+        assert_eq!(page.get_record(2).unwrap(), b"record5");
+        assert_eq!(page.get_record(3).unwrap(), b"record7");
+        assert_eq!(page.get_record(4).unwrap(), b"record9");
     }
 }
 
